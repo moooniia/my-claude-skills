@@ -1,0 +1,139 @@
+#!/bin/bash
+set -eo pipefail
+
+MODEL="${DIARY_MODEL:-qwen3:8b}"
+
+if [ $# -ge 1 ] && [ -f "$1" ]; then
+  INPUT=$(cat "$1")
+else
+  echo "粘贴你的日记原文（可以很乱），写完后按 Ctrl-D 结束输入：" >&2
+  INPUT=$(cat)
+fi
+
+if [ -z "${INPUT// /}" ]; then
+  echo "没有输入内容，已退出。" >&2
+  exit 1
+fi
+
+SYSTEM_PROMPT=$(cat <<'EOF'
+你是一位文字编辑，任务是把用户口语化、混乱的日记草稿，按句改写得更书面、更有沈从文（朴素清丽、克制留白）与龙应台（理性、清醒、温和）的语感，但绝对不能编造内容。这是一个"逐句改写"任务，不是"自由创作"任务。
+
+工作方法（必须严格遵守）：
+1. 把原文按意思拆成一句一句（一个完整的意思算一句）。
+2. 逐句改写，输出的句子数量应该跟原文的句子数量大致相同，不能合并多句为一句去概括，也不能把一句拆成几句去补充新内容。
+3. 每一句改写后的句子，只能表达"这一句原文"已经包含的意思，不能加入这句话之外的新信息。
+4. 改写的手段只有：换更书面/克制的词、调整语序、把"我很难过""我很开心"这种直白情绪词换成更含蓄的说法、给这一句里已经提到的情绪或时间感受配一个简短比喻（比如"时间过得快"可以说成"时间像风一样溜走"）。
+5. 绝对不能做的事：不能给原文没写出动作的人安排新的具体动作、姿势、表情、说的话；不能加入原文没提到的物品、地点、天气、声音、气味；不能编造任何原文没写的新事件、新回忆、新场景（比如原文只说"梦见某人"，不能写这个人在梦里坐在哪、拿着什么、说了什么）。
+6. 如果某一句很口语、很难找到文学化的说法，宁可只是把它写得简洁书面一点，也不要为了凑文采而编造细节。朴素但真实，好于华丽但失真。
+
+输出格式：
+- 把逐句改写的结果自然连成段落（不需要每句单独换行，按内容自然分段即可），但句子之间的事实对应关系必须能让人一一核对回原文。
+- 保留第一人称、日记体的私人语气。
+- 不要使用现代网络流行语、英文夹杂（除非原文本身有专有名词）。
+- 直接输出改写后的日记正文，不要加标题、不要加任何解释、说明、前后缀，也不要输出任何思考过程或 <think> 标签。
+
+风格参考（只用来体会语感、节奏、用词习惯，不要照抄其中任何内容、人物或场景到用户的日记里）：
+
+【沈从文《边城》节选】
+"由四川过湖南去，靠东有一条官路。这官路将近湘西边境到了一个地方名为"茶峒"的小山城时，有一小溪，溪边有座白色小塔，塔下住了一户单独的人家。这人家只一个老人，一个女孩子，一只黄狗。小溪流下去，绕山岨流，约三里便汇入茶峒的大河。人若过溪越小山走去，则只一里路就到了茶峒城边。溪流如弓背，山路如弓弦，故远近有了小小差异。小溪宽约二十丈，河床为大片石头作成。静静的水即或深到一篙不能落底，却依然清澈透明，河中游鱼来去皆可以计数。"
+体会这段的：用短句交代场景，用具体的数字和方位词（约三里、二十丈）代替模糊的形容，语气平静不抒情。
+
+【龙应台《目送》节选】
+"我慢慢地、慢慢地了解到，所谓父母子女一场，只不过意味着，你和他的缘分就是今生今世不断地在目送他的背影渐行渐远。你站立在小路的这一端，看着他逐渐消失在小路转弯的地方，而且，他用背影默默告诉你：不必追。"
+体会这段的：先讲一件具体小事，再用一两句平实但有分量的话点出感悟，感悟是从事情本身长出来的，不是另外贴上去的形容词。
+EOF
+)
+
+export DIARY_SYSTEM="$SYSTEM_PROMPT"
+export DIARY_INPUT="$INPUT"
+export DIARY_MODEL="$MODEL"
+
+echo "正在用模型 $MODEL 整理，本地推理中，可能要等 30 秒到 2 分钟，请稍候..." >&2
+
+FACTCHECK_PROMPT=$(cat <<'EOF'
+你是一个严格的事实核查编辑。下面会给你两段文字：【原文】是用户写的真实日记草稿，【改写稿】是另一位编辑把原文改写成文学风格后的版本。
+
+你的任务：逐句检查【改写稿】，找出其中任何"原文完全没有提到、但读起来像是在陈述真实发生过的事"的内容——包括：编造的具体场景、人物的动作/坐姿/手里拿的东西/说的话/外貌、编造的新事件（比如翻照片、回忆某个具体场景）、编造的天气/声音/气味等感官细节（如果原文没提到这件事本身）。
+
+形容抽象情绪、时间、感觉的比喻句（比如"时间像风吹散的沙"）不算编造，可以保留。
+
+把你找到的编造内容删除或改写成不超出原文事实范围的说法，保持整体的文学语感和日记体的第一人称语气，但每一句都必须能在【原文】里找到依据。如果【改写稿】本身已经没有编造内容，原样输出即可。
+
+只输出修订后的最终日记正文，不要输出"原文""改写稿"之类的标签，不要解释你做了什么修改，不要输出思考过程或 <think> 标签。
+EOF
+)
+
+export DIARY_FACTCHECK_SYSTEM="$FACTCHECK_PROMPT"
+
+python3 <<'PYEOF'
+import os
+import re
+import sys
+import json
+import subprocess
+import urllib.error
+import urllib.request
+
+DIARY_API = "http://localhost:11434/api/chat"
+
+
+def call_model(model, system, user_content, temperature):
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ],
+        "stream": False,
+        "think": False,
+        "options": {"temperature": temperature},
+    }
+    req = urllib.request.Request(
+        DIARY_API,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        print(f"调用 Ollama 失败：{e}\n请检查 Ollama 是否在运行（终端里跑一下 `ollama list` 看看有没有报错）。", file=sys.stderr)
+        sys.exit(1)
+    except TimeoutError:
+        print("等了 5 分钟还没回应，可能是模型卡住了，建议 Ctrl+C 后重试，或换个更小的模型（DIARY_MODEL=qwen2.5:3b-unlocked diary）。", file=sys.stderr)
+        sys.exit(1)
+
+    if "message" not in result:
+        print(f"Ollama 返回了异常结果：{result}", file=sys.stderr)
+        sys.exit(1)
+
+    text = result["message"]["content"]
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    return text
+
+
+system = os.environ["DIARY_SYSTEM"]
+factcheck_system = os.environ["DIARY_FACTCHECK_SYSTEM"]
+user = os.environ["DIARY_INPUT"]
+model = os.environ["DIARY_MODEL"]
+
+draft = call_model(model, system, user, 0.2)
+if not draft:
+    print("模型返回了空内容，建议重试一次。", file=sys.stderr)
+    sys.exit(1)
+
+print("（正在核对改写稿与原文是否一致，剔除编造内容...）", file=sys.stderr)
+
+factcheck_input = f"【原文】\n{user}\n\n【改写稿】\n{draft}"
+final_text = call_model(model, factcheck_system, factcheck_input, 0.1)
+if not final_text:
+    final_text = draft
+
+print(final_text)
+print()
+
+subprocess.run(["pbcopy"], input=final_text.encode("utf-8"))
+PYEOF
+
+echo "---" >&2
+echo "已整理完成，并已复制到剪贴板，直接粘贴进日记本即可。" >&2
